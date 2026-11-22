@@ -2,10 +2,19 @@
 
 namespace My_Redis;
 
-public class RedisStore
+public class Store
 {
     public ConcurrentDictionary<string, string> Keys { get; } = new();
     public ConcurrentDictionary<string, List<string>> Lists { get; } = new();
     public ConcurrentDictionary<string, Queue<TaskCompletionSource<string>>> WaitingClients { get; } = new();
-    public ConcurrentDictionary<string, ConcurrentDictionary<string, Dictionary<string, string>>> Streams { get; } = new();
+    public ConcurrentDictionary<string, ConcurrentStack<StreamEntry>> Streams { get; } = new();
+}
+public class StreamEntry
+{
+    public string Id { get; set; }
+    public Dictionary<string, string> Fields { get; set; }= new();
+    public StreamEntry(string Id)
+    {
+        this.Id = Id;
+    }
 }

@@ -7,7 +7,7 @@ public class Server
 {
     private readonly TcpListener _listener;
     private readonly CommandProcessor _commandProcessor;
-    public Server(RedisStore store,IPAddress address,int port)
+    public Server(Store store,IPAddress address,int port)
     {
         _listener = new TcpListener(address,port);
         _commandProcessor = new CommandProcessor(store);

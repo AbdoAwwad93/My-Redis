@@ -6,8 +6,8 @@ namespace My_Redis;
 
 public class CommandProcessor
 {
-    private readonly RedisStore _store;
-    public CommandProcessor(RedisStore store) => _store = store;
+    private readonly Store _store;
+    public CommandProcessor(Store store) => _store = store;
     public string Decode(byte[] bytes) => Encoding.UTF8.GetString(bytes);
     public async Task HandleClientAsync(Socket client)
     {
@@ -20,7 +20,6 @@ public class CommandProcessor
             var command = Decode(arguments[0]);
             if (command.Equal("PING"))
             {
-                var commanssssd = arguments[1];
                 byte[] response = RespWriter.Encode("+PONG\r\n");
                 await stream.WriteAsync(response);
             }
@@ -295,15 +294,41 @@ public class CommandProcessor
             {
                 var streamKey = Decode(arguments[1]);
                 var id = Decode(arguments[2]);
+                if (!int.TryParse(id.Split('-')[0], out var millisecond) || millisecond < 0)
+                {
+                    await stream.WriteAsync(RespWriter.Encode("-ERR The ID specified in XADD must be greater than 0-0\r\n"));
+                    continue;
+                }
+                if (!int.TryParse(id.Split('-')[1], out var sequence) || sequence <= 0)
+                {
+                    await stream.WriteAsync(RespWriter.Encode("-ERR The ID specified in XADD must be greater than 0-0\r\n"));
+                    continue;
+                }
                 var entries = _store.Streams.GetOrAdd(streamKey,
-                _ => new ConcurrentDictionary<string, Dictionary<string, string>>());
-                var fields = entries.GetOrAdd(id, _ => new Dictionary<string, string>());
+                _ => new ConcurrentStack<StreamEntry>());
+                if (entries.TryPeek(out var top))
+                {
+                    var topMilli = int.Parse(top.Id.Split('-')[0]);
+                    var topSeq = int.Parse(top.Id.Split('-')[1]);
+                    if (millisecond < topMilli)
+                    {
+                        await stream.WriteAsync(RespWriter.Encode("-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n"));
+                        continue;
+                    }
+                    if(millisecond==topMilli && sequence <= topSeq)
+                    {
+                        await stream.WriteAsync(RespWriter.Encode("-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n"));
+                        continue;
+                    }
+                }
+                var entry = new StreamEntry(id);
                 for (int i = 3; i < arguments.Length; i += 2)
                 {
                     var key = Decode(arguments[i]);
                     var value = Decode(arguments[i + 1]);
-                    fields[key] = value;
+                    entry.Fields[key] = value;
                 }
+                entries.Push(entry);
                 var response = RespWriter.Encode($"${id.Length}\r\n{id}\r\n");
                 await stream.WriteAsync(response);
             }
