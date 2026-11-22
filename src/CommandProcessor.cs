@@ -1,0 +1,313 @@
+﻿using System.Collections.Concurrent;
+using System.Net.Sockets;
+using System.Text;
+
+namespace My_Redis;
+
+public class CommandProcessor
+{
+    private readonly RedisStore _store;
+    public CommandProcessor(RedisStore store) => _store = store;
+    public string Decode(byte[] bytes) => Encoding.UTF8.GetString(bytes);
+    public async Task HandleClientAsync(Socket client)
+    {
+        using var stream = new NetworkStream(client);
+        var parser = new RespParser(stream);
+        while (true)
+        {
+            var arguments = await parser.ReadCommandAsync();
+            if (arguments == null) break;
+            var command = Decode(arguments[0]);
+            if (command.Equal("PING"))
+            {
+                var commanssssd = arguments[1];
+                byte[] response = RespWriter.Encode("+PONG\r\n");
+                await stream.WriteAsync(response);
+            }
+            else if (command.Equal("ECHO"))
+            {
+                var arg = arguments[1];
+                var header = RespWriter.Encode($"${arg.Length}\r\n");
+                var footer = RespWriter.Encode("\r\n");
+                await stream.WriteAsync(header);
+                await stream.WriteAsync(arg);
+                await stream.WriteAsync(footer);
+            }
+            else if (command.Equal("SET"))
+            {
+                var key = Decode(arguments[1]);
+                var value = Decode(arguments[2]);
+                if (arguments.Length == 3)
+                {
+                    _store.Keys[key] = value;
+                    var response = RespWriter.Encode("+OK\r\n");
+                    await stream.WriteAsync(response);
+                }
+                else if (arguments.Length == 5)
+                {
+                    var option = Decode(arguments[3]);
+                    if (!option.Equal("PX") && !option.Equal("EX"))
+                    {
+                        await stream.WriteAsync(RespWriter.Encode("-ERR not supported option\r\n"));
+                        continue;
+                    }
+                    if (int.TryParse(Decode(arguments[4]), out var time) && time > 0)
+                    {
+                        _store.Keys[key] = value;
+                        var response = RespWriter.Encode("+OK\r\n");
+                        await stream.WriteAsync(response);
+                        if (option.Equal("PX"))
+                        {
+                            _ = Task.Run(async () =>
+                            {
+                                await Task.Delay(time);
+                                _store.Keys.Remove(key, out var val);
+                            });
+                        }
+                        else if (option.Equal("EX"))
+                        {
+                            _ = Task.Run(async () =>
+                            {
+                                await Task.Delay(time * 1000);
+                                _store.Keys.Remove(key, out var val);
+                            });
+                        }
+
+                    }
+                    else
+                    {
+                        await stream.WriteAsync(RespWriter.Encode("-ERR invalid expire value\r\n"));
+                    }
+                }
+                else
+                {
+                    await stream.WriteAsync(RespWriter.Encode("-ERR invalid command options\r\n"));
+                }
+
+            }
+            else if (command.Equal("GET"))
+            {
+
+                var key = Decode(arguments[1]);
+                if (_store.Keys.TryGetValue(key, out var value))
+                {
+                    var len = Encoding.UTF8.GetByteCount(value);
+                    var response = RespWriter.Encode($"${len}\r\n{value}\r\n");
+                    await stream.WriteAsync(response);
+                }
+                else
+                {
+                    var response = RespWriter.Encode($"$-1\r\n");
+                    await stream.WriteAsync(response);
+                }
+            }
+            else if (command.Equal("RPUSH"))
+            {
+                if (arguments.Length < 3)
+                {
+                    await stream.WriteAsync(RespWriter.Encode("-ERR invalid command argumentss\r\n"));
+                    continue;
+                }
+                var listName = Decode(arguments[1]);
+                if (!_store.Lists.Keys.Contains(listName))
+                {
+                    _store.Lists[listName] = new List<string>();
+                }
+                var resultLength = _store.Lists[listName].Count;
+                for (int i = 2; i < arguments.Length; i++)
+                {
+                    var value = Decode(arguments[i]);
+                    resultLength++;
+                    if (_store.WaitingClients.TryGetValue(listName, out var waiters) && waiters.Count > 0)
+                    {
+                        var waiter = waiters.Dequeue();
+                        waiter.TrySetResult(value);
+                    }
+                    else _store.Lists[listName].Add(value);
+                }
+                await stream.WriteAsync(RespWriter.Encode($":{resultLength}\r\n"));
+
+            }
+            else if (command.Equal("LRANGE"))
+            {
+                if (arguments.Length < 4)
+                {
+                    await stream.WriteAsync(RespWriter.Encode("-ERR invalid command argumentss\r\n"));
+                }
+                else
+                {
+                    var listName = Decode(arguments[1]);
+                    var start = Decode(arguments[2]);
+                    var stop = Decode(arguments[3]);
+                    if (!int.TryParse(start, out var startval) || !int.TryParse(stop, out var stopval))
+                    {
+                        await stream.WriteAsync(RespWriter.Encode("-ERR invalid start or stop arguments\r\n"));
+                        continue;
+                    }
+                    if (startval < 0) startval = _store.Lists[listName].Count + startval;
+                    if (stopval < 0) stopval = _store.Lists[listName].Count + stopval;
+                    if (!_store.Lists.Keys.Contains(listName) || startval >= _store.Lists[listName].Count ||
+                    startval > stopval)
+                    {
+                        await stream.WriteAsync(RespWriter.Encode("*0\r\n"));
+                        continue;
+                    }
+                    if (stopval >= _store.Lists[listName].Count) stopval = _store.Lists[listName].Count - 1;
+                    if (startval < 0) startval = 0;
+                    var response = $"*{stopval - startval + 1}\r\n";
+                    for (int i = startval; i <= stopval; i++)
+                    {
+                        response += $"${_store.Lists[listName][i].Length}\r\n{_store.Lists[listName][i]}\r\n";
+                    }
+                    await stream.WriteAsync(RespWriter.Encode(response));
+                }
+            }
+            else if (command.Equal("LPUSH"))
+            {
+                if (arguments.Length < 3)
+                {
+                    await stream.WriteAsync(RespWriter.Encode("-ERR invalid command argumentss\r\n"));
+                    continue;
+                }
+                var listName = Decode(arguments[1]);
+                if (!_store.Lists.Keys.Contains(listName))
+                {
+                    _store.Lists[listName] = new List<string>();
+                }
+                for (int i = 2; i < arguments.Length; i++)
+                {
+                    var value = Decode(arguments[i]);
+                    _store.Lists[listName].Insert(0, value);
+                }
+                await stream.WriteAsync(RespWriter.Encode($":{_store.Lists[listName].Count}\r\n"));
+            }
+            else if (command.Equal("LLEN"))
+            {
+                if (arguments.Length < 2)
+                {
+                    await stream.WriteAsync(RespWriter.Encode("-ERR invalid command argumentss\r\n"));
+                    continue;
+                }
+                var listName = Decode(arguments[1]);
+                if (!_store.Lists.Keys.Contains(listName))
+                {
+                    await stream.WriteAsync(RespWriter.Encode(":0\r\n"));
+                    continue;
+                }
+                await stream.WriteAsync(RespWriter.Encode($":{_store.Lists[listName].Count}\r\n"));
+            }
+            else if (command.Equal("LPOP"))
+            {
+                if (arguments.Length < 2)
+                {
+                    await stream.WriteAsync(RespWriter.Encode("-ERR invalid command argumentss\r\n"));
+                    continue;
+                }
+                int rangeval = 0;
+                if (arguments.Length > 2)
+                {
+                    var range = Decode(arguments[2]);
+                    if (!int.TryParse(range, out rangeval))
+                    {
+                        await stream.WriteAsync(RespWriter.Encode("-ERR invalid command argumentss\r\n"));
+                        continue;
+                    }
+                }
+                var listName = Decode(arguments[1]);
+                if (!_store.Lists.Keys.Contains(listName) || _store.Lists[listName].Count == 0)
+                {
+                    await stream.WriteAsync(RespWriter.Encode("$-1\r\n"));
+                    continue;
+                }
+                if (rangeval == 0)
+                {
+                    var value = _store.Lists[listName][0];
+                    _store.Lists[listName].RemoveAt(0);
+                    await stream.WriteAsync(RespWriter.Encode($"${value.Length}\r\n{value}\r\n"));
+                    continue;
+                }
+                if (rangeval >= _store.Lists[listName].Count) rangeval = _store.Lists[listName].Count;
+                var response = $"*{rangeval}\r\n";
+                for (int i = 0; i < rangeval; i++)
+                {
+                    var value = _store.Lists[listName][0];
+                    response += $"${value.Length}\r\n{value}\r\n";
+                    _store.Lists[listName].RemoveAt(0);
+                }
+                await stream.WriteAsync(RespWriter.Encode(response));
+            }
+            else if (command.Equal("BLPOP"))
+            {
+                if (arguments.Length < 3)
+                {
+                    await stream.WriteAsync(RespWriter.Encode("-ERR invalid command argumentss\r\n"));
+                    continue;
+                }
+                if (!double.TryParse(Decode(arguments[2]), out var timeout))
+                {
+                    await stream.WriteAsync(RespWriter.Encode("-ERR invalid command timout\r\n"));
+                    continue;
+                }
+                var listName = Decode(arguments[1]);
+                if (_store.Lists.TryGetValue(listName, out var list) && list.Count > 0)
+                {
+                    var value = list[0];
+                    list.RemoveAt(0);
+                    await stream.WriteAsync(RespWriter.Encode($"*2\r\n${listName.Length}\r\n{listName}\r\n${value.Length}\r\n{value}\r\n"));
+                    continue;
+                }
+                var waiter = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+                var waiters = _store.WaitingClients.GetOrAdd(listName, _ => new Queue<TaskCompletionSource<string>>());
+                waiters.Enqueue(waiter);
+                if (timeout == 0)
+                {
+                    var value = await waiter.Task;
+                    await stream.WriteAsync(RespWriter.Encode($"*2\r\n${listName.Length}\r\n{listName}\r\n${value.Length}\r\n{value}\r\n"));
+                }
+                else if (timeout > 0)
+                {
+                    try
+                    {
+                        var value = await waiter.Task.WaitAsync(TimeSpan.FromSeconds(timeout));
+                        await stream.WriteAsync(RespWriter.Encode($"*2\r\n${listName.Length}\r\n{listName}\r\n${value.Length}\r\n{value}\r\n"));
+
+                    }
+                    catch (TimeoutException)
+                    {
+                        await stream.WriteAsync(RespWriter.Encode($"*-1\r\n"));
+                    }
+                }
+            }
+            else if (command.Equal("TYPE"))
+            {
+                if (arguments.Length < 2)
+                {
+                    await stream.WriteAsync(RespWriter.Encode("-ERR invalid command args"));
+                    continue;
+                }
+                var key = Decode(arguments[1]);
+                // string? value;
+                if (_store.Keys.TryGetValue(key, out var value)) await stream.WriteAsync(RespWriter.Encode("+string\r\n"));
+                else if (_store.Streams.TryGetValue(key, out var value2)) await stream.WriteAsync(RespWriter.Encode("+stream\r\n"));
+                else await stream.WriteAsync(RespWriter.Encode("+none\r\n"));
+            }
+            else if (command.Equal("XADD"))
+            {
+                var streamKey = Decode(arguments[1]);
+                var id = Decode(arguments[2]);
+                var entries = _store.Streams.GetOrAdd(streamKey,
+                _ => new ConcurrentDictionary<string, Dictionary<string, string>>());
+                var fields = entries.GetOrAdd(id, _ => new Dictionary<string, string>());
+                for (int i = 3; i < arguments.Length; i += 2)
+                {
+                    var key = Decode(arguments[i]);
+                    var value = Decode(arguments[i + 1]);
+                    fields[key] = value;
+                }
+                var response = RespWriter.Encode($"${id.Length}\r\n{id}\r\n");
+                await stream.WriteAsync(response);
+            }
+        }
+
+    }
+}
