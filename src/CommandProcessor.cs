@@ -108,21 +108,31 @@ public class CommandProcessor
                     continue;
                 }
                 var listName = Decode(arguments[1]);
-                if (!_store.Lists.Keys.Contains(listName))
+                var listLock = _store.ListLocks.GetOrAdd(listName, _ => new object());
+                int resultLength;
+                lock (listLock)
                 {
-                    _store.Lists[listName] = new List<string>();
-                }
-                var resultLength = _store.Lists[listName].Count;
-                for (int i = 2; i < arguments.Length; i++)
-                {
-                    var value = Decode(arguments[i]);
-                    resultLength++;
-                    if (_store.WaitingClients.TryGetValue(listName, out var waiters) && waiters.Count > 0)
+                    var list = _store.Lists.GetOrAdd(listName, _ => new List<string>());
+                    resultLength = list.Count;
+                    for (int i = 2; i < arguments.Length; i++)
                     {
-                        var waiter = waiters.Dequeue();
-                        waiter.TrySetResult(value);
+                        var value = Decode(arguments[i]);
+                        resultLength++;
+                        var delivered = false;
+                        if (_store.WaitingClients.TryGetValue(listName, out var waiters))
+                        {
+                            while (waiters.Count > 0)
+                            {
+                                var waiter = waiters.Dequeue();
+                                if (waiter.TrySetResult(value))
+                                {
+                                    delivered = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!delivered) list.Add(value);
                     }
-                    else _store.Lists[listName].Add(value);
                 }
                 await stream.WriteAsync(RespWriter.Encode($":{resultLength}\r\n"));
 
@@ -161,7 +171,7 @@ public class CommandProcessor
                     await stream.WriteAsync(RespWriter.Encode(response));
                 }
             }
-            else if (command.Equal("LPUSH"))
+                       else if (command.Equal("LPUSH"))
             {
                 if (arguments.Length < 3)
                 {
@@ -169,16 +179,33 @@ public class CommandProcessor
                     continue;
                 }
                 var listName = Decode(arguments[1]);
-                if (!_store.Lists.Keys.Contains(listName))
+                var listLock = _store.ListLocks.GetOrAdd(listName, _ => new object());
+                int resultLength;
+                lock (listLock)
                 {
-                    _store.Lists[listName] = new List<string>();
+                    var list = _store.Lists.GetOrAdd(listName, _ => new List<string>());
+                    resultLength = list.Count;
+                    for (int i = 2; i < arguments.Length; i++)
+                    {
+                        var value = Decode(arguments[i]);
+                        resultLength++;
+                        var delivered = false;
+                        if (_store.WaitingClients.TryGetValue(listName, out var waiters))
+                        {
+                            while (waiters.Count > 0)
+                            {
+                                var waiter = waiters.Dequeue();
+                                if (waiter.TrySetResult(value))
+                                {
+                                    delivered = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!delivered) list.Insert(0, value);
+                    }
                 }
-                for (int i = 2; i < arguments.Length; i++)
-                {
-                    var value = Decode(arguments[i]);
-                    _store.Lists[listName].Insert(0, value);
-                }
-                await stream.WriteAsync(RespWriter.Encode($":{_store.Lists[listName].Count}\r\n"));
+                await stream.WriteAsync(RespWriter.Encode($":{resultLength}\r\n"));
             }
             else if (command.Equal("LLEN"))
             {
@@ -248,16 +275,27 @@ public class CommandProcessor
                     continue;
                 }
                 var listName = Decode(arguments[1]);
-                if (_store.Lists.TryGetValue(listName, out var list) && list.Count > 0)
+                var listLock = _store.ListLocks.GetOrAdd(listName, _ => new object());
+                var waiter = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+                string? immediateValue = null;
+                lock (listLock)
                 {
-                    var value = list[0];
-                    list.RemoveAt(0);
-                    await stream.WriteAsync(RespWriter.Encode($"*2\r\n${listName.Length}\r\n{listName}\r\n${value.Length}\r\n{value}\r\n"));
+                    if (_store.Lists.TryGetValue(listName, out var list) && list.Count > 0)
+                    {
+                        immediateValue = list[0];
+                        list.RemoveAt(0);
+                    }
+                    else
+                    {
+                        var waiters = _store.WaitingClients.GetOrAdd(listName, _ => new Queue<TaskCompletionSource<string>>());
+                        waiters.Enqueue(waiter);
+                    }
+                }
+                if (immediateValue is not null)
+                {
+                    await stream.WriteAsync(RespWriter.Encode($"*2\r\n${listName.Length}\r\n{listName}\r\n${immediateValue.Length}\r\n{immediateValue}\r\n"));
                     continue;
                 }
-                var waiter = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
-                var waiters = _store.WaitingClients.GetOrAdd(listName, _ => new Queue<TaskCompletionSource<string>>());
-                waiters.Enqueue(waiter);
                 if (timeout == 0)
                 {
                     var value = await waiter.Task;
@@ -273,6 +311,25 @@ public class CommandProcessor
                     }
                     catch (TimeoutException)
                     {
+                        string? deliveredValue = null;
+                        lock (listLock)
+                        {
+                            if (waiter.Task.IsCompletedSuccessfully)
+                            {
+                                deliveredValue = waiter.Task.Result;
+                            }
+                            else if (_store.WaitingClients.TryGetValue(listName, out var queued))
+                            {
+                                var remaining = queued.Where(item => !ReferenceEquals(item, waiter)).ToArray();
+                                queued.Clear();
+                                foreach (var item in remaining) queued.Enqueue(item);
+                            }
+                        }
+                        if (deliveredValue is not null)
+                        {
+                            await stream.WriteAsync(RespWriter.Encode($"*2\r\n${listName.Length}\r\n{listName}\r\n${deliveredValue.Length}\r\n{deliveredValue}\r\n"));
+                            continue;
+                        }
                         await stream.WriteAsync(RespWriter.Encode($"*-1\r\n"));
                     }
                 }
@@ -315,7 +372,7 @@ public class CommandProcessor
                         await stream.WriteAsync(RespWriter.Encode("-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n"));
                         continue;
                     }
-                    if(millisecond==topMilli && sequence <= topSeq)
+                    if (millisecond == topMilli && sequence <= topSeq)
                     {
                         await stream.WriteAsync(RespWriter.Encode("-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n"));
                         continue;
