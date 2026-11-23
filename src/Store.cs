@@ -7,8 +7,9 @@ public class Store
     public ConcurrentDictionary<string, string> Keys { get; } = new();
     public ConcurrentDictionary<string, List<string>> Lists { get; } = new();
     public ConcurrentDictionary<string, Queue<TaskCompletionSource<string>>> WaitingClients { get; } = new();
-    public ConcurrentDictionary<string, ConcurrentStack<StreamEntry>> Streams { get; } = new();
-    public ConcurrentDictionary<string, object>ListLocks{get;} = new();
+    public ConcurrentDictionary<string, object> ListLocks { get; } = new();
+    public ConcurrentDictionary<string, List<StreamEntry>> Streams { get; } = new();
+    public ConcurrentDictionary<string, object> StreamLocks { get; } = new();
 }
 public class StreamEntry
 {
