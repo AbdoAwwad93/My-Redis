@@ -347,37 +347,54 @@ public class CommandProcessor
                 else if (_store.Streams.TryGetValue(key, out var value2)) await stream.WriteAsync(RespWriter.Encode("+stream\r\n"));
                 else await stream.WriteAsync(RespWriter.Encode("+none\r\n"));
             }
-            else if (command.Equal("XADD"))
+           else if (command.Equal("XADD"))
             {
+                if (arguments.Length < 5 || arguments.Length % 2 == 0)
+                {
+                    await stream.WriteAsync(RespWriter.Encode("-ERR wrong number of arguments for 'xadd' command\r\n"));
+                    continue;
+                }
                 var streamKey = Decode(arguments[1]);
-                var id = Decode(arguments[2]);
-                if (!int.TryParse(id.Split('-')[0], out var millisecond) || millisecond < 0)
+                var requestedId = Decode(arguments[2]);
+                var idParts = requestedId.Split('-');
+                if (idParts.Length != 2 || !long.TryParse(idParts[0], out var millisecond) || millisecond < 0)
                 {
                     await stream.WriteAsync(RespWriter.Encode("-ERR The ID specified in XADD must be greater than 0-0\r\n"));
                     continue;
                 }
-                if (!int.TryParse(id.Split('-')[1], out var sequence) || sequence <= 0)
+
+                var autoSequence = idParts[1].Equal("*");
+                long sequence;
+                if (autoSequence)
+                {
+                    sequence = millisecond == 0 ? 1 : 0;
+                }
+                else if (!long.TryParse(idParts[1], out sequence) || sequence < 0)
+                {
+                    await stream.WriteAsync(RespWriter.Encode("-ERR The ID specified in XADD must be greater than 0-0\r\n"));
+                    continue;
+                }
+
+                if (millisecond == 0 && sequence == 0)
                 {
                     await stream.WriteAsync(RespWriter.Encode("-ERR The ID specified in XADD must be greater than 0-0\r\n"));
                     continue;
                 }
                 var entries = _store.Streams.GetOrAdd(streamKey,
-                _ => new ConcurrentStack<StreamEntry>());
+                 _ => new ConcurrentStack<StreamEntry>());
                 if (entries.TryPeek(out var top))
                 {
-                    var topMilli = int.Parse(top.Id.Split('-')[0]);
-                    var topSeq = int.Parse(top.Id.Split('-')[1]);
-                    if (millisecond < topMilli)
+                    var topParts = top.Id.Split('-');
+                    var topMilli = long.Parse(topParts[0]);
+                    var topSequence = long.Parse(topParts[1]);
+                    if (millisecond < topMilli || (millisecond == topMilli && !autoSequence && sequence <= topSequence))
                     {
                         await stream.WriteAsync(RespWriter.Encode("-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n"));
                         continue;
                     }
-                    if (millisecond == topMilli && sequence <= topSeq)
-                    {
-                        await stream.WriteAsync(RespWriter.Encode("-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n"));
-                        continue;
-                    }
+                    if (autoSequence && millisecond == topMilli) sequence = topSequence + 1;
                 }
+                var id = $"{millisecond}-{sequence}";
                 var entry = new StreamEntry(id);
                 for (int i = 3; i < arguments.Length; i += 2)
                 {
@@ -386,7 +403,7 @@ public class CommandProcessor
                     entry.Fields[key] = value;
                 }
                 entries.Push(entry);
-                var response = RespWriter.Encode($"${id.Length}\r\n{id}\r\n");
+                var response = RespWriter.Encode($"${entry.Id.Length}\r\n{entry.Id}\r\n");
                 await stream.WriteAsync(response);
             }
         }
