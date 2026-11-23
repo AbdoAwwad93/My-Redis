@@ -465,14 +465,8 @@ public class CommandProcessor
 
                 if (!_store.Streams.TryGetValue(key, out var entries))
                 {
-                    await stream.WriteAsync(RespWriter.Encode("*0\r\n"));
+                    await stream.WriteAsync(RespWriter.EmptyArray());
                     continue;
-                }
-
-                static int CompareId(long leftMilli, long leftSequence, long rightMilli, long rightSequence)
-                {
-                    var byMilliseconds = leftMilli.CompareTo(rightMilli);
-                    return byMilliseconds != 0 ? byMilliseconds : leftSequence.CompareTo(rightSequence);
                 }
 
                 StreamEntry[] entrySnapshot;
@@ -488,8 +482,8 @@ public class CommandProcessor
                         var idParts = entry.Id.Split('-');
                         return (Entry: entry, Milliseconds: long.Parse(idParts[0]), Sequence: long.Parse(idParts[1]));
                     })
-                    .Where(item => CompareId(item.Milliseconds, item.Sequence, startMilli, startSequence) >= 0 &&
-                                   CompareId(item.Milliseconds, item.Sequence, endMilli, endSequence) <= 0)
+                    .Where(item => Helper.CompareId(item.Milliseconds, item.Sequence, startMilli, startSequence) >= 0 &&
+                                   Helper.CompareId(item.Milliseconds, item.Sequence, endMilli, endSequence) <= 0)
                     .ToArray();
 
                 var response = new StringBuilder($"*{matchingEntries.Length}\r\n");
@@ -503,6 +497,90 @@ public class CommandProcessor
                         RespWriter.AppendBulkString(response, field.Key);
                         RespWriter.AppendBulkString(response, field.Value);
                     }
+                }
+                await stream.WriteAsync(RespWriter.Encode(response.ToString()));
+            }
+            else if (command.Equal("XREAD"))
+            {
+                if (arguments.Length < 4 || !Helper.Decode(arguments[1]).Equal("STREAMS") || (arguments.Length - 2) % 2 != 0)
+                {
+                    await stream.WriteAsync(RespWriter.Error("Invalid arguments for XREAD"));
+                    continue;
+                }
+                var streamCount = (arguments.Length - 2) / 2;
+                var streamResponses = new List<string>();
+                string? invalidIdError = null;
+                for (int i = 0; i < streamCount; i++)
+                {
+                    var key = Helper.Decode(arguments[2 + i]);
+                    var id = Helper.Decode(arguments[2 + streamCount + i]);
+                    var idParts = id.Split('-');
+                    if (idParts.Length != 2 || !long.TryParse(idParts[0], out var startMille) ||
+                        !long.TryParse(idParts[1], out var startSeq) || startMille < 0 || startSeq < 0)
+                    {
+                        invalidIdError = "-ERR Invalid ID\r\n";
+                        break;
+                    }
+
+                    if (!_store.Streams.TryGetValue(key, out var entries))
+                    {
+                        continue;
+                    }
+
+                    var streamLock = _store.StreamLocks.GetOrAdd(key, _ => new object());
+                    StreamEntry[] entrySnapshot;
+                    lock (streamLock)
+                    {
+                        entrySnapshot = entries.ToArray();
+                    }
+
+                    var matchingEntries = entrySnapshot
+                        .Select(entry =>
+                        {
+                            var idParts = entry.Id.Split('-');
+                            return (Entry: entry, Milliseconds: long.Parse(idParts[0]), Sequence: long.Parse(idParts[1]));
+                        })
+                        .Where(item => Helper.CompareId(item.Milliseconds, item.Sequence, startMille, startSeq) > 0)
+                        .ToArray();
+
+                    if (matchingEntries.Length == 0)
+                    {
+                        continue;
+                    }
+
+                    var streamResponse = new StringBuilder("*2\r\n");
+                    RespWriter.AppendBulkString(streamResponse, key);
+                    streamResponse.Append($"*{matchingEntries.Length}\r\n");
+                    foreach (var item in matchingEntries)
+                    {
+                        streamResponse.Append("*2\r\n");
+                        RespWriter.AppendBulkString(streamResponse, item.Entry.Id);
+                        streamResponse.Append($"*{item.Entry.Fields.Count * 2}\r\n");
+                        foreach (var field in item.Entry.Fields)
+                        {
+                            RespWriter.AppendBulkString(streamResponse, field.Key);
+                            RespWriter.AppendBulkString(streamResponse, field.Value);
+                        }
+                    }
+                    streamResponses.Add(streamResponse.ToString());
+                }
+
+                if (invalidIdError is not null)
+                {
+                    await stream.WriteAsync(RespWriter.Encode(invalidIdError));
+                    continue;
+                }
+
+                if (streamResponses.Count == 0)
+                {
+                    await stream.WriteAsync(RespWriter.Encode("*-1\r\n"));
+                    continue;
+                }
+
+                var response = new StringBuilder($"*{streamResponses.Count}\r\n");
+                foreach (var streamResponse in streamResponses)
+                {
+                    response.Append(streamResponse);
                 }
                 await stream.WriteAsync(RespWriter.Encode(response.ToString()));
             }

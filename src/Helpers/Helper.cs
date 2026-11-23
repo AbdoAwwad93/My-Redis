@@ -5,7 +5,12 @@ namespace My_Redis.src.Helpers;
 
 public class Helper
 {
-    public static string Decode(byte[] bytes) => Encoding.UTF8.GetString(bytes);
+    public static string Decode(byte[] bytes) => Encoding.UTF8.GetString(bytes); 
+    public static int CompareId(long leftMilli, long leftSequence, long rightMilli, long rightSequence)
+    {
+        var byMilliseconds = leftMilli.CompareTo(rightMilli);
+        return byMilliseconds != 0 ? byMilliseconds : leftSequence.CompareTo(rightSequence);
+    }
     public static bool TryParseRangeBound(string bound, bool isStart, out long milliseconds, out long sequence)
     {
         if (bound == "-")
@@ -37,5 +42,4 @@ public class Helper
         sequence = 0;
         return false;
     }
-
 }
