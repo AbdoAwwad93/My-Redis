@@ -1,7 +1,7 @@
 using System;
 using System.Text;
 
-namespace My_Redis.src.Helpers;
+namespace My_Redis.src.Helper;
 
 public class Helper
 {

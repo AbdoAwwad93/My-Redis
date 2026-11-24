@@ -1,7 +1,6 @@
 using System.Text;
-using My_Redis;
-using My_Redis.src;
-using My_Redis.src.Commands;
+using System.Net.Sockets;
+using My_Redis.src.Helper;
 
 namespace My_Redis.Commands;
 
@@ -16,27 +15,27 @@ public sealed class PushCommand : ICommandHandler
         _prepend = prepend;
     }
 
-    public async Task ExecuteAsync(byte[][] arguments, CommandContext context)
+    public async Task ExecuteAsync(byte[][] arguments, Store store, NetworkStream stream)
     {
         if (arguments.Length < 3)
         {
-            await context.WriteAsync(RespWriter.Error("wrong number of arguments"));
+            await stream.WriteResponseAsync(RespWriter.Error("wrong number of arguments"));
             return;
         }
 
         var key = Helper.Decode(arguments[1]);
-        var listLock = context.Store.ListLocks.GetOrAdd(key, _ => new object());
+        var listLock = store.ListLocks.GetOrAdd(key, _ => new object());
         int resultLength;
         lock (listLock)
         {
-            var list = context.Store.Lists.GetOrAdd(key, _ => new List<string>());
+            var list = store.Lists.GetOrAdd(key, _ => new List<string>());
             resultLength = list.Count;
             for (var i = 2; i < arguments.Length; i++)
             {
                 var value = Helper.Decode(arguments[i]);
                 resultLength++;
                 var delivered = false;
-                if (context.Store.WaitingClients.TryGetValue(key, out var waiters))
+                if (store.WaitingClients.TryGetValue(key, out var waiters))
                 {
                     while (waiters.Count > 0)
                     {
@@ -57,7 +56,7 @@ public sealed class PushCommand : ICommandHandler
             }
         }
 
-        await context.WriteAsync($":{resultLength}\r\n");
+        await stream.WriteResponseAsync($":{resultLength}\r\n");
     }
 }
 
@@ -65,11 +64,11 @@ public sealed class LRangeCommand : ICommandHandler
 {
     public string Name => "LRANGE";
 
-    public async Task ExecuteAsync(byte[][] arguments, CommandContext context)
+    public async Task ExecuteAsync(byte[][] arguments, Store store, NetworkStream stream)
     {
         if (arguments.Length != 4)
         {
-            await context.WriteAsync(RespWriter.Error("wrong number of arguments for 'lrange' command"));
+            await stream.WriteResponseAsync(RespWriter.Error("wrong number of arguments for 'lrange' command"));
             return;
         }
 
@@ -77,15 +76,15 @@ public sealed class LRangeCommand : ICommandHandler
         if (!int.TryParse(Helper.Decode(arguments[2]), out var start) ||
             !int.TryParse(Helper.Decode(arguments[3]), out var stop))
         {
-            await context.WriteAsync(RespWriter.Error("invalid start or stop arguments"));
+            await stream.WriteResponseAsync(RespWriter.Error("invalid start or stop arguments"));
             return;
         }
 
-        var listLock = context.Store.ListLocks.GetOrAdd(key, _ => new object());
+        var listLock = store.ListLocks.GetOrAdd(key, _ => new object());
         string[] values;
         lock (listLock)
         {
-            if (!context.Store.Lists.TryGetValue(key, out var list) || list.Count == 0)
+            if (!store.Lists.TryGetValue(key, out var list) || list.Count == 0)
             {
                 values = Array.Empty<string>();
             }
@@ -105,7 +104,7 @@ public sealed class LRangeCommand : ICommandHandler
         var response = new StringBuilder($"*{values.Length}\r\n");
         foreach (var value in values)
             RespWriter.AppendBulkString(response, value);
-        await context.WriteAsync(response.ToString());
+        await stream.WriteResponseAsync(response.ToString());
     }
 }
 
@@ -113,20 +112,20 @@ public sealed class LLenCommand : ICommandHandler
 {
     public string Name => "LLEN";
 
-    public async Task ExecuteAsync(byte[][] arguments, CommandContext context)
+    public async Task ExecuteAsync(byte[][] arguments, Store store, NetworkStream stream)
     {
         if (arguments.Length != 2)
         {
-            await context.WriteAsync(RespWriter.Error("wrong number of arguments for 'llen' command"));
+            await stream.WriteResponseAsync(RespWriter.Error("wrong number of arguments for 'llen' command"));
             return;
         }
 
         var key = Helper.Decode(arguments[1]);
-        var listLock = context.Store.ListLocks.GetOrAdd(key, _ => new object());
+        var listLock = store.ListLocks.GetOrAdd(key, _ => new object());
         int length;
         lock (listLock)
-            length = context.Store.Lists.TryGetValue(key, out var list) ? list.Count : 0;
-        await context.WriteAsync($":{length}\r\n");
+            length = store.Lists.TryGetValue(key, out var list) ? list.Count : 0;
+        await stream.WriteResponseAsync($":{length}\r\n");
     }
 }
 
@@ -134,11 +133,11 @@ public sealed class LPopCommand : ICommandHandler
 {
     public string Name => "LPOP";
 
-    public async Task ExecuteAsync(byte[][] arguments, CommandContext context)
+    public async Task ExecuteAsync(byte[][] arguments, Store store, NetworkStream stream)
     {
         if (arguments.Length is < 2 or > 3)
         {
-            await context.WriteAsync(RespWriter.Error("wrong number of arguments for 'lpop' command"));
+            await stream.WriteResponseAsync(RespWriter.Error("wrong number of arguments for 'lpop' command"));
             return;
         }
 
@@ -146,16 +145,16 @@ public sealed class LPopCommand : ICommandHandler
         var count = 1;
         if (countProvided && (!int.TryParse(Helper.Decode(arguments[2]), out count) || count < 0))
         {
-            await context.WriteAsync(RespWriter.Error("invalid count"));
+            await stream.WriteResponseAsync(RespWriter.Error("invalid count"));
             return;
         }
 
         var key = Helper.Decode(arguments[1]);
-        var listLock = context.Store.ListLocks.GetOrAdd(key, _ => new object());
+        var listLock = store.ListLocks.GetOrAdd(key, _ => new object());
         string[] popped;
         lock (listLock)
         {
-            if (!context.Store.Lists.TryGetValue(key, out var list) || list.Count == 0 || count == 0)
+            if (!store.Lists.TryGetValue(key, out var list) || list.Count == 0 || count == 0)
             {
                 popped = Array.Empty<string>();
             }
@@ -170,12 +169,12 @@ public sealed class LPopCommand : ICommandHandler
         if (!countProvided)
         {
             if (popped.Length == 0)
-                await context.WriteAsync("$-1\r\n");
+                await stream.WriteResponseAsync("$-1\r\n");
             else
             {
                 var response = new StringBuilder();
                 RespWriter.AppendBulkString(response, popped[0]);
-                await context.WriteAsync(response.ToString());
+                await stream.WriteResponseAsync(response.ToString());
             }
             return;
         }
@@ -183,7 +182,7 @@ public sealed class LPopCommand : ICommandHandler
         var arrayResponse = new StringBuilder($"*{popped.Length}\r\n");
         foreach (var value in popped)
             RespWriter.AppendBulkString(arrayResponse, value);
-        await context.WriteAsync(arrayResponse.ToString());
+        await stream.WriteResponseAsync(arrayResponse.ToString());
     }
 }
 
@@ -191,35 +190,35 @@ public sealed class BLPopCommand : ICommandHandler
 {
     public string Name => "BLPOP";
 
-    public async Task ExecuteAsync(byte[][] arguments, CommandContext context)
+    public async Task ExecuteAsync(byte[][] arguments, Store store, NetworkStream stream)
     {
         if (arguments.Length != 3 || !double.TryParse(Helper.Decode(arguments[2]), out var timeout) || timeout < 0)
         {
-            await context.WriteAsync(RespWriter.Error("invalid BLPOP arguments"));
+            await stream.WriteResponseAsync(RespWriter.Error("invalid BLPOP arguments"));
             return;
         }
 
         var key = Helper.Decode(arguments[1]);
-        var listLock = context.Store.ListLocks.GetOrAdd(key, _ => new object());
+        var listLock = store.ListLocks.GetOrAdd(key, _ => new object());
         var waiter = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
         string? immediateValue = null;
         lock (listLock)
         {
-            if (context.Store.Lists.TryGetValue(key, out var list) && list.Count > 0)
+            if (store.Lists.TryGetValue(key, out var list) && list.Count > 0)
             {
                 immediateValue = list[0];
                 list.RemoveAt(0);
             }
             else
             {
-                var waiters = context.Store.WaitingClients.GetOrAdd(key, _ => new Queue<TaskCompletionSource<string>>());
+                var waiters = store.WaitingClients.GetOrAdd(key, _ => new Queue<TaskCompletionSource<string>>());
                 waiters.Enqueue(waiter);
             }
         }
 
         if (immediateValue is not null)
         {
-            await WritePairAsync(context, key, immediateValue);
+            await WritePairAsync(stream, key, immediateValue);
             return;
         }
 
@@ -228,7 +227,7 @@ public sealed class BLPopCommand : ICommandHandler
             var value = timeout == 0
                 ? await waiter.Task
                 : await waiter.Task.WaitAsync(TimeSpan.FromSeconds(timeout));
-            await WritePairAsync(context, key, value);
+            await WritePairAsync(stream, key, value);
         }
         catch (TimeoutException)
         {
@@ -237,26 +236,26 @@ public sealed class BLPopCommand : ICommandHandler
             {
                 if (waiter.Task.IsCompletedSuccessfully)
                     deliveredValue = waiter.Task.Result;
-                else if (context.Store.WaitingClients.TryGetValue(key, out var queued))
+                else if (store.WaitingClients.TryGetValue(key, out var queued))
                 {
-                    var remaining = queued.Where(item => !ReferenceEquals(item, waiter)).ToArray();
+                    var remaining = queued.Where(item => !ReferenceEquals(item, waiter)).ToList();
                     queued.Clear();
                     foreach (var item in remaining) queued.Enqueue(item);
                 }
             }
 
             if (deliveredValue is null)
-                await context.WriteAsync("*-1\r\n");
+                await stream.WriteResponseAsync("*-1\r\n");
             else
-                await WritePairAsync(context, key, deliveredValue);
+                await WritePairAsync(stream, key, deliveredValue);
         }
     }
 
-    private static Task WritePairAsync(CommandContext context, string key, string value)
+    private static Task WritePairAsync(NetworkStream stream, string key, string value)
     {
         var response = new StringBuilder("*2\r\n");
         RespWriter.AppendBulkString(response, key);
         RespWriter.AppendBulkString(response, value);
-        return context.WriteAsync(response.ToString()).AsTask();
+        return stream.WriteResponseAsync(response.ToString()).AsTask();
     }
 }

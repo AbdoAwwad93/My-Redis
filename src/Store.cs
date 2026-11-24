@@ -1,4 +1,4 @@
-﻿using System.Collections.Concurrent;
+using System.Collections.Concurrent;
 
 namespace My_Redis;
 
@@ -10,6 +10,7 @@ public class Store
     public ConcurrentDictionary<string, object> ListLocks { get; } = new();
     public ConcurrentDictionary<string, List<StreamEntry>> Streams { get; } = new();
     public ConcurrentDictionary<string, object> StreamLocks { get; } = new();
+    public ConcurrentDictionary<string, List<TaskCompletionSource<bool>>> StreamReadWaiters { get; } = new();
 }
 public class StreamEntry
 {

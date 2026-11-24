@@ -1,8 +1,7 @@
 ﻿using System.Net.Sockets;
 using My_Redis.Commands;
 using My_Redis.RESP;
-using My_Redis.src.Commands;
-using My_Redis.src.Helpers;
+using My_Redis.src.Helper;
 
 namespace My_Redis;
 
@@ -37,7 +36,6 @@ public sealed class CommandProcessor
     {
         using var stream = new NetworkStream(client);
         var parser = new RespParser(stream);
-        var context = new CommandContext(_store, stream);
 
         while (true)
         {
@@ -47,18 +45,18 @@ public sealed class CommandProcessor
 
             if (arguments.Length == 0)
             {
-                await context.WriteAsync(RespWriter.Error("empty command"));
+                await stream.WriteResponseAsync(RespWriter.Error("empty command"));
                 continue;
             }
 
             var commandName = Helper.Decode(arguments[0]);
             if (!_handlers.TryGetValue(commandName, out var handler))
             {
-                await context.WriteAsync(RespWriter.Error($"unknown command '{commandName}'"));
+                await stream.WriteResponseAsync(RespWriter.Error($"unknown command '{commandName}'"));
                 continue;
             }
 
-            await handler.ExecuteAsync(arguments, context);
+            await handler.ExecuteAsync(arguments, _store, stream);
         }
     }
 }

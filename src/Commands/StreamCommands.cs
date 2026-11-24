@@ -1,7 +1,7 @@
 using System.Text;
-using My_Redis;
-using My_Redis.src;
-using My_Redis.src.Commands;
+using System.Net.Sockets;
+using My_Redis.src.Helper;
+using My_Redis.RESP;
 
 namespace My_Redis.Commands;
 
@@ -9,11 +9,11 @@ public sealed class XAddCommand : ICommandHandler
 {
     public string Name => "XADD";
 
-    public async Task ExecuteAsync(byte[][] arguments, CommandContext context)
+    public async Task ExecuteAsync(byte[][] arguments, Store store, NetworkStream stream)
     {
         if (arguments.Length < 5 || arguments.Length % 2 == 0)
         {
-            await context.WriteAsync(RespWriter.Error("wrong number of arguments for 'xadd' command"));
+            await stream.WriteResponseAsync(RespWriter.Error("wrong number of arguments for 'xadd' command"));
             return;
         }
 
@@ -28,7 +28,7 @@ public sealed class XAddCommand : ICommandHandler
         }
         else if (idParts.Length != 2 || !long.TryParse(idParts[0], out milliseconds) || milliseconds < 0)
         {
-            await WriteIdErrorAsync(context, "The ID specified in XADD must be greater than 0-0");
+            await WriteIdErrorAsync(stream, "The ID specified in XADD must be greater than 0-0");
             return;
         }
 
@@ -40,7 +40,7 @@ public sealed class XAddCommand : ICommandHandler
             sequence = milliseconds == 0 ? 1 : 0;
         else if (!long.TryParse(idParts[1], out sequence) || sequence < 0)
         {
-            await WriteIdErrorAsync(context, "The ID specified in XADD must be greater than 0-0");
+            await WriteIdErrorAsync(stream, "The ID specified in XADD must be greater than 0-0");
             return;
         }
 
@@ -48,11 +48,11 @@ public sealed class XAddCommand : ICommandHandler
         for (var i = 3; i < arguments.Length; i += 2)
             entry.Fields[Helper.Decode(arguments[i])] = Helper.Decode(arguments[i + 1]);
 
-        var streamLock = context.Store.StreamLocks.GetOrAdd(streamKey, _ => new object());
+        var streamLock = store.StreamLocks.GetOrAdd(streamKey, _ => new object());
         string? error = null;
         lock (streamLock)
         {
-            var entries = context.Store.Streams.GetOrAdd(streamKey, _ => new List<StreamEntry>());
+            var entries = store.Streams.GetOrAdd(streamKey, _ => new List<StreamEntry>());
             if (milliseconds == 0 && sequence == 0)
                 error = "The ID specified in XADD must be greater than 0-0";
             else if (entries.Count > 0)
@@ -89,33 +89,40 @@ public sealed class XAddCommand : ICommandHandler
             {
                 entry.Id = $"{milliseconds}-{sequence}";
                 entries.Add(entry);
+
+                if (store.StreamReadWaiters.TryGetValue(streamKey, out var waiters))
+                {
+                    foreach (var waiter in waiters)
+                        waiter.TrySetResult(true);
+                    waiters.Clear();
+                }
             }
         }
 
         if (error is not null)
         {
-            await WriteIdErrorAsync(context, error);
+            await WriteIdErrorAsync(stream, error);
             return;
         }
 
         var response = new StringBuilder();
         RespWriter.AppendBulkString(response, entry.Id);
-        await context.WriteAsync(response.ToString());
+        await stream.WriteResponseAsync(response.ToString());
     }
 
-    private static Task WriteIdErrorAsync(CommandContext context, string message) =>
-        context.WriteAsync($"-ERR {message}\r\n").AsTask();
+    private static Task WriteIdErrorAsync(NetworkStream stream, string message) =>
+        stream.WriteResponseAsync($"-ERR {message}\r\n").AsTask();
 }
 
 public sealed class XRangeCommand : ICommandHandler
 {
     public string Name => "XRANGE";
 
-    public async Task ExecuteAsync(byte[][] arguments, CommandContext context)
+    public async Task ExecuteAsync(byte[][] arguments, Store store, NetworkStream stream)
     {
         if (arguments.Length != 4)
         {
-            await context.WriteAsync(RespWriter.Error("wrong number of arguments for 'xrange' command"));
+            await stream.WriteResponseAsync(RespWriter.Error("wrong number of arguments for 'xrange' command"));
             return;
         }
 
@@ -123,20 +130,20 @@ public sealed class XRangeCommand : ICommandHandler
         if (!Helper.TryParseRangeBound(Helper.Decode(arguments[2]), true, out var startMilliseconds, out var startSequence) ||
             !Helper.TryParseRangeBound(Helper.Decode(arguments[3]), false, out var endMilliseconds, out var endSequence))
         {
-            await context.WriteAsync(RespWriter.Error("invalid stream ID specified as range bound"));
+            await stream.WriteResponseAsync(RespWriter.Error("invalid stream ID specified as range bound"));
             return;
         }
 
-        if (!context.Store.Streams.TryGetValue(key, out var entries))
+        if (!store.Streams.TryGetValue(key, out var entries))
         {
-            await context.WriteAsync(RespWriter.EmptyArray());
+            await stream.WriteResponseAsync(RespWriter.EmptyArray());
             return;
         }
 
-        var streamLock = context.Store.StreamLocks.GetOrAdd(key, _ => new object());
-        StreamEntry[] snapshot;
+        var streamLock = store.StreamLocks.GetOrAdd(key, _ => new object());
+        List<StreamEntry> snapshot;
         lock (streamLock)
-            snapshot = entries.ToArray();
+            snapshot = entries.ToList();
 
         var matchingEntries = snapshot
             .Select(entry =>
@@ -146,12 +153,12 @@ public sealed class XRangeCommand : ICommandHandler
             })
             .Where(item => Helper.CompareId(item.Milliseconds, item.Sequence, startMilliseconds, startSequence) >= 0 &&
                            Helper.CompareId(item.Milliseconds, item.Sequence, endMilliseconds, endSequence) <= 0)
-            .ToArray();
+            .ToList();
 
-        var response = new StringBuilder($"*{matchingEntries.Length}\r\n");
+        var response = new StringBuilder($"*{matchingEntries.Count}\r\n");
         foreach (var item in matchingEntries)
             AppendEntry(response, item.Entry);
-        await context.WriteAsync(response.ToString());
+        await stream.WriteResponseAsync(response.ToString());
     }
 
     internal static void AppendEntry(StringBuilder response, StreamEntry entry)
@@ -171,64 +178,176 @@ public sealed class XReadCommand : ICommandHandler
 {
     public string Name => "XREAD";
 
-    public async Task ExecuteAsync(byte[][] arguments, CommandContext context)
+    public async Task ExecuteAsync(byte[][] arguments, Store store, NetworkStream stream)
     {
-        if (arguments.Length < 4 || !Helper.Decode(arguments[1]).Equal("STREAMS") || (arguments.Length - 2) % 2 != 0)
+        var streamsKeywordIndex = 1;
+        var firstKeyIndex = 2;
+        int? blockTimeoutMilliseconds = null;
+
+        if (arguments.Length > 1 && Helper.Decode(arguments[1]).Equal("BLOCK"))
         {
-            await context.WriteAsync(RespWriter.Error("invalid arguments for XREAD"));
+            if (arguments.Length < 6 || !int.TryParse(Helper.Decode(arguments[2]), out var timeout) || timeout < 0)
+            {
+                await stream.WriteResponseAsync(RespWriter.Error("invalid BLOCK timeout"));
+                return;
+            }
+            blockTimeoutMilliseconds = timeout;
+            streamsKeywordIndex = 3;
+            firstKeyIndex = 4;
+        }
+
+        if (arguments.Length <= streamsKeywordIndex ||
+            !Helper.Decode(arguments[streamsKeywordIndex]).Equal("STREAMS") ||
+            arguments.Length - firstKeyIndex < 2 || (arguments.Length - firstKeyIndex) % 2 != 0)
+        {
+            await stream.WriteResponseAsync(RespWriter.Error("invalid arguments for XREAD"));
             return;
         }
 
-        var streamCount = (arguments.Length - 2) / 2;
-        var streamResponses = new List<string>();
+        var streamCount = (arguments.Length - firstKeyIndex) / 2;
+        var requests = new List<StreamReadRequest>(streamCount);
         for (var i = 0; i < streamCount; i++)
         {
-            var key = Helper.Decode(arguments[2 + i]);
-            var idParts = Helper.Decode(arguments[2 + streamCount + i]).Split('-');
+            var key = Helper.Decode(arguments[firstKeyIndex + i]);
+            var idParts = Helper.Decode(arguments[firstKeyIndex + streamCount + i]).Split('-');
             if (idParts.Length != 2 || !long.TryParse(idParts[0], out var startMilliseconds) ||
                 !long.TryParse(idParts[1], out var startSequence) || startMilliseconds < 0 || startSequence < 0)
             {
-                await context.WriteAsync(RespWriter.Error("invalid ID"));
+                await stream.WriteResponseAsync(RespWriter.Error("invalid ID"));
+                return;
+            }
+            requests.Add(new StreamReadRequest(key, startMilliseconds, startSequence));
+        }
+
+        if (blockTimeoutMilliseconds is null)
+        {
+            await stream.WriteResponseAsync(BuildResponse(requests, store) ?? "*-1\r\n");
+            return;
+        }
+
+        var deadline = blockTimeoutMilliseconds.Value == 0
+            ? (DateTimeOffset?)null
+            : DateTimeOffset.UtcNow.AddMilliseconds(blockTimeoutMilliseconds.Value);
+
+        while (true)
+        {
+            var response = BuildResponse(requests, store);
+            if (response is not null)
+            {
+                await stream.WriteResponseAsync(response);
                 return;
             }
 
-            if (!context.Store.Streams.TryGetValue(key, out var entries))
+            var waiter = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var keys = requests.Select(request => request.Key).Distinct(StringComparer.Ordinal).ToList();
+            RegisterWaiter(keys, waiter, store);
+
+            response = BuildResponse(requests, store);
+            if (response is not null)
+            {
+                RemoveWaiter(keys, waiter, store);
+                await stream.WriteResponseAsync(response);
+                return;
+            }
+
+            var timedOut = false;
+            try
+            {
+                if (deadline is null)
+                    await waiter.Task;
+                else
+                {
+                    var remaining = deadline.Value - DateTimeOffset.UtcNow;
+                    if (remaining <= TimeSpan.Zero)
+                        timedOut = true;
+                    else
+                        await waiter.Task.WaitAsync(remaining);
+                }
+            }
+            catch (TimeoutException)
+            {
+                timedOut = true;
+            }
+            finally
+            {
+                RemoveWaiter(keys, waiter, store);
+            }
+
+            if (timedOut)
+            {
+                await stream.WriteResponseAsync(BuildResponse(requests, store) ?? "*-1\r\n");
+                return;
+            }
+        }
+    }
+
+    private static string? BuildResponse(IReadOnlyList<StreamReadRequest> requests, Store store)
+    {
+        var streamResponses = new List<string>();
+        foreach (var request in requests)
+        {
+            if (!store.Streams.TryGetValue(request.Key, out var entries))
                 continue;
 
-            var streamLock = context.Store.StreamLocks.GetOrAdd(key, _ => new object());
-            StreamEntry[] snapshot;
+            var streamLock = store.StreamLocks.GetOrAdd(request.Key, _ => new object());
+            List<StreamEntry> snapshot;
             lock (streamLock)
-                snapshot = entries.ToArray();
+                snapshot = entries.ToList();
 
             var matchingEntries = snapshot
-                .Select(entry =>
+                .Where(entry =>
                 {
                     var parts = entry.Id.Split('-');
-                    return (Entry: entry, Milliseconds: long.Parse(parts[0]), Sequence: long.Parse(parts[1]));
+                    return Helper.CompareId(long.Parse(parts[0]), long.Parse(parts[1]),
+                        request.StartMilliseconds, request.StartSequence) > 0;
                 })
-                .Where(item => Helper.CompareId(item.Milliseconds, item.Sequence, startMilliseconds, startSequence) > 0)
-                .ToArray();
+                .ToList();
 
-            if (matchingEntries.Length == 0)
+            if (matchingEntries.Count == 0)
                 continue;
 
             var streamResponse = new StringBuilder("*2\r\n");
-            RespWriter.AppendBulkString(streamResponse, key);
-            streamResponse.Append($"*{matchingEntries.Length}\r\n");
-            foreach (var item in matchingEntries)
-                XRangeCommand.AppendEntry(streamResponse, item.Entry);
+            RespWriter.AppendBulkString(streamResponse, request.Key);
+            streamResponse.Append($"*{matchingEntries.Count}\r\n");
+            foreach (var entry in matchingEntries)
+                XRangeCommand.AppendEntry(streamResponse, entry);
             streamResponses.Add(streamResponse.ToString());
         }
 
         if (streamResponses.Count == 0)
-        {
-            await context.WriteAsync("*-1\r\n");
-            return;
-        }
+            return null;
 
         var response = new StringBuilder($"*{streamResponses.Count}\r\n");
         foreach (var streamResponse in streamResponses)
             response.Append(streamResponse);
-        await context.WriteAsync(response.ToString());
+        return response.ToString();
     }
+
+    private static void RegisterWaiter(List<string> keys, TaskCompletionSource<bool> waiter, Store store)
+    {
+        foreach (var key in keys)
+        {
+            var streamLock = store.StreamLocks.GetOrAdd(key, _ => new object());
+            lock (streamLock)
+            {
+                var waiters = store.StreamReadWaiters.GetOrAdd(key, _ => new List<TaskCompletionSource<bool>>());
+                waiters.Add(waiter);
+            }
+        }
+    }
+
+    private static void RemoveWaiter(List<string> keys, TaskCompletionSource<bool> waiter, Store store)
+    {
+        foreach (var key in keys)
+        {
+            var streamLock = store.StreamLocks.GetOrAdd(key, _ => new object());
+            lock (streamLock)
+            {
+                if (store.StreamReadWaiters.TryGetValue(key, out var waiters))
+                    waiters.Remove(waiter);
+            }
+        }
+    }
+
+    private sealed record StreamReadRequest(string Key, long StartMilliseconds, long StartSequence);
 }
