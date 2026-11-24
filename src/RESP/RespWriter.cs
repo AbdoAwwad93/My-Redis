@@ -1,6 +1,6 @@
 ﻿using System.Text;
 
-namespace My_Redis;
+namespace My_Redis.RESP;
 
 public static class RespWriter
 {

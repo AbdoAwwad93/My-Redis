@@ -1,5 +1,5 @@
 ﻿using System.Text;
-namespace My_Redis;
+namespace My_Redis.RESP;
 public class RespParser
 {
     private readonly Stream _stream;
